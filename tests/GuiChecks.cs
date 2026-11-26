@@ -1,13 +1,26 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 internal static class GuiChecks
 {
+    private const BindingFlags InstanceMembers = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+    [DllImport("user32.dll")]
+    private static extern uint GetClipboardSequenceNumber();
+
+    private enum Step
+    {
+        StartInTray, Setup, AddCredential, SaveCredential, VerifyCredential, SaveNote, Search, OpenDetails,
+        CheckDetails, CancelDiscard, ConfirmDiscard, Discard, Hide, ChangePassword,
+        SavePassword, Lock, UnlockFromTray, EnterPassword, SeedPages, VerifyPages, SavePagedRecord, VerifyPagedSave, Done
+    }
+
     private static IEnumerable<Control> Children(Control parent)
     {
         foreach (Control child in parent.Controls)
@@ -22,11 +35,221 @@ internal static class GuiChecks
         return Children(form).OfType<TextBox>().Single(c => c.AccessibleName == name);
     }
 
-    private static void Click(Form form, string text)
+    private static Button ActionButton(Form form, string name, bool iconOnly = false)
     {
-        var button = Children(form).OfType<Button>().Single(b => b.Text == text);
-        if (!button.Visible || !button.Enabled) throw new Exception(text + " unavailable");
+        return Children(form).OfType<Button>().Single(candidate =>
+            iconOnly ? candidate.AccessibleName == name && candidate.Text == "" : candidate.Text == name);
+    }
+
+    private static void Click(Form form, string name, bool iconOnly = false)
+    {
+        var button = ActionButton(form, name, iconOnly);
+        if (!button.Visible || !button.Enabled) throw new Exception(name + " unavailable");
         button.PerformClick();
+    }
+
+    private static void CheckCompactLibrary(Form form)
+    {
+        if (Children(form).Any(control => control.Visible && control.Text == "我的记录"))
+            throw new Exception("The former records heading is still visible");
+        if (Children(form).OfType<Button>().Any(button => button.Text == "复制账号" || button.Text == "复制密码"))
+            throw new Exception("Standalone copy buttons are still present in the library");
+        if (form.CurrentAutoScaleDimensions == new SizeF(96, 96) && form.ClientSize.Width != 290)
+            throw new Exception("The library does not open at 290 pixels wide at 100% scaling");
+
+        var toolbar = new[] { "新建", "锁定", "设置" }.Select(name => ActionButton(form, name, true)).ToArray();
+        // Compare resting colors so the live mouse position cannot influence the result.
+        var normal = toolbar[0].GetType().GetField("normal", InstanceMembers);
+        if (toolbar.Any(button => !button.Visible || !button.Enabled || button.ForeColor != toolbar[0].ForeColor ||
+                                   !Equals(normal.GetValue(button), normal.GetValue(toolbar[0]))))
+            throw new Exception("Toolbar icons do not share the same style");
+    }
+
+    private static void CheckPager(Form form, bool canGoBack, bool canGoForward)
+    {
+        var previous = ActionButton(form, "上一页", true);
+        var next = ActionButton(form, "下一页", true);
+        if (!previous.Visible || !next.Visible || previous.Enabled != canGoBack || next.Enabled != canGoForward)
+            throw new Exception("Pagination arrow visibility or enabled state is wrong");
+        var footerLabel = Children(previous.Parent).OfType<Label>().Single(label => label.Visible);
+        foreach (var control in new Control[] { previous, next, footerLabel })
+            if (!control.Parent.ClientRectangle.Contains(control.Bounds))
+                throw new Exception("A pagination footer control is clipped");
+    }
+
+    private static void AddPageFixtures(Form form)
+    {
+        // Add fixtures only to the temporary vault already opened by this test.
+        var store = form.GetType().GetField("store", InstanceMembers).GetValue(form);
+        var noteType = form.GetType().Assembly.GetType("Note", true);
+        var title = noteType.GetField("Title", InstanceMembers);
+        var save = store.GetType().GetMethod("Save", InstanceMembers);
+        for (int i = 1; i <= 17; i++)
+        {
+            var note = Activator.CreateInstance(noteType, true);
+            title.SetValue(note, "分页测试 " + i.ToString("D3"));
+            save.Invoke(store, new[] { note });
+        }
+    }
+
+    private static void CheckPageRecords(ListView list, int newest, int oldest)
+    {
+        if (list.Items.Count != newest - oldest + 1)
+            throw new Exception("The page does not show the expected number of records");
+        for (int i = 0; i < list.Items.Count; i++)
+            if (list.Items[i].Text != "分页测试 " + (newest - i).ToString("D3"))
+                throw new Exception("The page does not show the expected records in order");
+    }
+
+    private static int CheckPageNavigation(Form form)
+    {
+        var list = Records(form);
+        CheckPageRecords(list, 17, 10);
+        CheckPager(form, false, true);
+        int fullPageHeight = form.ClientSize.Height;
+
+        Click(form, "下一页", true);
+        CheckPageRecords(list, 9, 2);
+        CheckPager(form, true, true);
+        if (form.ClientSize.Height != fullPageHeight)
+            throw new Exception("The second full page changed the fitted height");
+
+        Click(form, "下一页", true);
+        CheckPageRecords(list, 1, 1);
+        CheckPager(form, true, false);
+        if (form.ClientSize.Height >= fullPageHeight)
+            throw new Exception("The window did not shrink for the last page");
+
+        Click(form, "上一页", true);
+        CheckPageRecords(list, 9, 2);
+        CheckPager(form, true, true);
+        if (form.ClientSize.Height != fullPageHeight)
+            throw new Exception("Returning to a full page did not restore the fitted height");
+        return fullPageHeight;
+    }
+
+    private static void OpenSelectedDetails(ListView list)
+    {
+        typeof(ListView).GetMethod("OnItemActivate", InstanceMembers).Invoke(list, new object[] { EventArgs.Empty });
+    }
+
+    private static ListView Records(Form form)
+    {
+        return Children(form).OfType<ListView>().Single(c => c.AccessibleName == "记录列表");
+    }
+
+    private static ToolStripItem MenuItem(ContextMenuStrip menu, string text)
+    {
+        return menu.Items.Cast<ToolStripItem>().Single(item => item.Text == text);
+    }
+
+    private static void ClickPasswordSetting(Form form)
+    {
+        Click(form, "设置", true);
+        var menu = (ContextMenuStrip)form.GetType().GetField("settingsMenu", InstanceMembers).GetValue(form);
+        ToolStripItem changePassword;
+        try
+        {
+            var autoStart = MenuItem(menu, "开机自启动") as ToolStripMenuItem;
+            changePassword = MenuItem(menu, "更改主密码");
+            if (!menu.Visible || autoStart == null || !autoStart.Available || !changePassword.Enabled)
+                throw new Exception("Settings menu items unavailable");
+        }
+        finally { menu.Close(); }
+        changePassword.PerformClick();
+    }
+
+    private static void CheckNoVaultPath(Form form, string path)
+    {
+        string file = Path.GetFileName(path);
+        if (form.Text.Contains(file) || Children(form).Any(control => control.Visible && control.Text.Contains(file)))
+            throw new Exception("A vault path is visible in the form");
+    }
+
+    private static void CheckCopyMenu(ListView list, ListViewItem item)
+    {
+        item.EnsureVisible();
+        var point = new Point(item.Bounds.Left + 8, item.Bounds.Top + item.Bounds.Height / 2);
+        typeof(Control).GetMethod("OnMouseDown", InstanceMembers).Invoke(list,
+            new object[] { new MouseEventArgs(MouseButtons.Right, 1, point.X, point.Y, 0) });
+        if (list.SelectedItems.Count != 1 || list.SelectedItems[0] != item)
+            throw new Exception("Right click did not select the clicked record");
+
+        var menu = list.ContextMenuStrip;
+        if (menu == null) throw new Exception("Record context menu unavailable");
+        menu.Show(list, point);
+        try
+        {
+            var copyAccount = MenuItem(menu, "复制账号");
+            var copyPassword = MenuItem(menu, "复制密码");
+            if (!menu.Visible || !copyAccount.Enabled || !copyPassword.Enabled)
+                throw new Exception("Record context menu copy actions unavailable");
+            CheckCopy("record context menu", copyAccount.PerformClick, copyPassword.PerformClick);
+        }
+        finally { menu.Close(); }
+    }
+
+    private static void CheckDetailCopy(Form form)
+    {
+        var copyAccount = Children(form).OfType<Button>().Single(button => button.AccessibleName == "复制账号");
+        var copyPassword = Children(form).OfType<Button>().Single(button => button.AccessibleName == "复制密码");
+        if (!copyAccount.Visible || !copyAccount.Enabled || !copyPassword.Visible || !copyPassword.Enabled)
+            throw new Exception("Record details copy buttons unavailable");
+        CheckCopy("record details", copyAccount.PerformClick, copyPassword.PerformClick);
+    }
+
+    // Drive the real tray callbacks without depending on the current Explorer overflow position.
+    private static NotifyIcon Tray()
+    {
+        Type threadContext = typeof(Application).GetNestedType("ThreadContext", BindingFlags.NonPublic);
+        var thread = threadContext.GetMethod("FromCurrent", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, null);
+        var session = threadContext.GetProperty("ApplicationContext", InstanceMembers).GetValue(thread, null);
+        var tray = (NotifyIcon)session.GetType().GetField("tray", InstanceMembers).GetValue(session);
+        if (!tray.Visible || tray.ContextMenuStrip == null) throw new Exception("Tray unavailable");
+        return tray;
+    }
+
+    private static void OpenFromTray()
+    {
+        var tray = Tray();
+        typeof(NotifyIcon).GetMethod("OnMouseDoubleClick", InstanceMembers).Invoke(tray,
+            new object[] { new MouseEventArgs(MouseButtons.Left, 2, 0, 0, 0) });
+    }
+
+    private static uint AssertClipboard(Action copy, string expected)
+    {
+        copy();
+        uint sequence = GetClipboardSequenceNumber();
+        if (Clipboard.GetText() != expected) throw new Exception("Copy did not place the requested field on the clipboard");
+        return sequence;
+    }
+
+    private static void CheckCopy(string source, Action copyAccount, Action copyPassword)
+    {
+        const string account = "ui-lab";
+        const string password = "dummy-only";
+        IDataObject previous;
+        try { previous = Clipboard.GetDataObject(); }
+        catch (ExternalException)
+        {
+            Console.WriteLine("SKIP clipboard transfer from " + source + " (Windows clipboard unavailable)");
+            return;
+        }
+        uint sequence = 0;
+        try
+        {
+            sequence = AssertClipboard(copyAccount, account);
+            sequence = AssertClipboard(copyPassword, password);
+            Console.WriteLine("PASS clipboard transfer from " + source);
+        }
+        finally
+        {
+            if (sequence != 0 && sequence == GetClipboardSequenceNumber())
+            {
+                if (previous == null) Clipboard.Clear();
+                else Clipboard.SetDataObject(previous, true);
+            }
+        }
     }
 
     [STAThread]
@@ -49,58 +272,200 @@ internal static class GuiChecks
             "vault-ui-" + Guid.NewGuid().ToString("N"))).FullName;
         string path = Path.Combine(folder, "smoke.qnv");
         var clock = Stopwatch.StartNew();
-        int step = 0;
-        string secret = "temporary-test-passphrase";
+        bool startInTray = args.Length == 2 && args[1] == "--startup";
+        Step step = startInTray ? Step.StartInTray : Step.Setup;
+        int emptyHeight = 0;
+        int oneRecordHeight = 0;
+        int fullPageHeight = 0;
+        long savedRecordId = 0;
+        const string secret = "初";
+        const string newSecret = "新";
+        const string main = "密笺 · 资料库";
+        const string detail = "密笺 · 记录详情";
+        const string newRecord = "密笺 · 新建记录";
+        const string dirtyPrompt = "密笺 · 未保存的修改";
+        Exception checkError = null;
         using (var timer = new Timer { Interval = 350 })
         {
-            timer.Tick += delegate {
-                if (clock.Elapsed.TotalSeconds > 35) throw new TimeoutException("UI step " + step);
-                var form = Application.OpenForms.Cast<Form>().LastOrDefault();
-                if (form == null || !form.Visible) return;
-                bool login = form.GetType().Name == "UnlockForm";
-                if (step == 0 && login)
+            Action checkStep = delegate {
+                if (clock.Elapsed.TotalSeconds > 45) throw new TimeoutException("UI step " + step);
+                var form = Application.OpenForms.Cast<Form>().LastOrDefault(candidate => candidate.Visible);
+                if (step == Step.StartInTray)
                 {
-                    Field(form, "主密码").Text = Field(form, "确认主密码").Text = secret;
-                    step++; Click(form, "创建资料库");
+                    if (form != null || File.Exists(path)) throw new Exception("Startup opened the vault before a tray request");
+                    step = Step.Setup;
+                    OpenFromTray();
+                    Console.WriteLine("PASS startup starts locked in the tray");
+                    return;
                 }
-                else if (step == 1 && !login)
+                if (step == Step.UnlockFromTray)
+                {
+                    if (form != null) throw new Exception("Lock left a vault window visible");
+                    step = Step.EnterPassword;
+                    OpenFromTray();
+                }
+                if (form == null) return;
+
+                if (step == Step.Setup && form.Text == "密笺 · 创建资料库")
+                {
+                    CheckNoVaultPath(form, path);
+                    Field(form, "主密码").Text = Field(form, "确认主密码").Text = secret;
+                    step = Step.AddCredential;
+                    Click(form, "创建资料库");
+                }
+                else if (step == Step.AddCredential && form.Text == main)
+                {
+                    CheckCompactLibrary(form);
+                    CheckPager(form, false, false);
+                    emptyHeight = form.ClientSize.Height;
+                    step = Step.SaveCredential;
+                    Click(form, "新建", true);
+                }
+                else if (step == Step.SaveCredential && form.Text == newRecord)
                 {
                     Field(form, "标题").Text = "测试账号";
                     Field(form, "账号").Text = "ui-lab";
                     Field(form, "密码").Text = "dummy-only";
                     Field(form, "便签正文").Text = "测试备注";
+                    step = Step.VerifyCredential;
                     Click(form, "保存");
-                    var list = Children(form).OfType<ListView>().Single();
-                    if (list.Items.Count != 1) throw new Exception("Save did not publish a row");
-                    step++; Click(form, "新建");
                 }
-                else if (step == 2 && !login)
+                else if (step == Step.VerifyCredential && form.Text == main)
+                {
+                    var list = Records(form);
+                    if (list.Items.Count != 1) throw new Exception("Save did not publish a row");
+                    CheckPager(form, false, false);
+                    oneRecordHeight = form.ClientSize.Height;
+                    step = Step.SaveNote;
+                    Click(form, "新建", true);
+                }
+                else if (step == Step.SaveNote && form.Text == newRecord)
                 {
                     Field(form, "标题").Text = "无账号便签";
                     Field(form, "便签正文").Text = "测试多行\r\n第二行";
+                    step = Step.Search;
                     Click(form, "保存");
-                    Field(form, "搜索标题或账号").Text = "ui-lab";
-                    step++;
                 }
-                else if (step == 3 && !login)
+                else if (step == Step.Search && form.Text == main)
                 {
-                    var list = Children(form).OfType<ListView>().Single();
+                    var list = Records(form);
+                    if (list.Items.Count != 2) throw new Exception("Plain note did not publish a row");
+                    if (form.ClientSize.Height <= emptyHeight || form.ClientSize.Height <= oneRecordHeight)
+                        throw new Exception("The library height did not increase for additional records");
+                    CheckPager(form, false, false);
+                    list.Items.Cast<ListViewItem>().Single(item => item.Text == "无账号便签").Selected = true;
+                    CheckCopyMenu(list, list.Items.Cast<ListViewItem>().Single(item => item.Text == "测试账号"));
+                    Field(form, "搜索标题或账号").Text = "ui-lab";
+                    step = Step.OpenDetails;
+                }
+                else if (step == Step.OpenDetails && form.Text == main)
+                {
+                    var list = Records(form);
                     if (list.Items.Count != 1 || list.Items[0].Text != "测试账号") return;
                     list.Items[0].Selected = true;
+                    step = Step.CheckDetails;
+                    OpenSelectedDetails(list);
+                }
+                else if (step == Step.CheckDetails && form.Text == detail)
+                {
                     if (Field(form, "便签正文").Text != "测试备注") throw new Exception("Wrong detail");
                     if (!Field(form, "密码").UseSystemPasswordChar) throw new Exception("Password visible");
-                    step++; Click(form, "锁定");
+                    CheckDetailCopy(form);
+                    Field(form, "便签正文").Text = "unsaved edit";
+                    step = Step.CancelDiscard;
+                    form.Close();
                 }
-                else if (step == 4 && login)
+                else if (step == Step.CancelDiscard && form.Text == dirtyPrompt)
                 {
-                    Field(form, "主密码").Text = secret;
-                    step++; Click(form, "解锁");
+                    step = Step.ConfirmDiscard;
+                    Click(form, "取消");
                 }
-                else if (step == 5 && !login)
+                else if (step == Step.ConfirmDiscard && form.Text == detail)
                 {
-                    if (Children(form).OfType<ListView>().Single().Items.Count != 2)
-                        throw new Exception("Missing records after unlock");
-                    step++; form.Close();
+                    if (Field(form, "便签正文").Text != "unsaved edit") throw new Exception("Cancel lost the edit");
+                    step = Step.Discard;
+                    form.Close();
+                }
+                else if (step == Step.Discard && form.Text == dirtyPrompt)
+                {
+                    step = Step.Hide;
+                    Click(form, "放弃");
+                }
+                else if (step == Step.Hide && form.Text == main)
+                {
+                    form.Close();
+                    if (form.Visible || form.IsDisposed) throw new Exception("Close did not hide the vault");
+                    MenuItem(Tray().ContextMenuStrip, "打开密笺").PerformClick();
+                    if (!form.Visible || Field(form, "搜索标题或账号").Text != "ui-lab" || Records(form).SelectedItems.Count != 1)
+                        throw new Exception("Restore did not preserve the search and selection");
+                    step = Step.ChangePassword;
+                }
+                else if (step == Step.ChangePassword && form.Text == main)
+                {
+                    step = Step.SavePassword;
+                    ClickPasswordSetting(form);
+                }
+                else if (step == Step.SavePassword && form.Text == "密笺 · 更改主密码")
+                {
+                    Field(form, "当前主密码").Text = secret;
+                    Field(form, "新主密码").Text = Field(form, "确认新主密码").Text = newSecret;
+                    step = Step.Lock;
+                    Click(form, "更改主密码");
+                }
+                else if (step == Step.Lock && form.Text == main)
+                {
+                    step = Step.UnlockFromTray;
+                    Click(form, "锁定", true);
+                }
+                else if (step == Step.EnterPassword && form.Text == "密笺 · 解锁资料库")
+                {
+                    CheckNoVaultPath(form, path);
+                    Field(form, "主密码").Text = newSecret;
+                    step = Step.SeedPages;
+                    Click(form, "解锁");
+                }
+                else if (step == Step.SeedPages && form.Text == main)
+                {
+                    if (Records(form).Items.Count != 2) throw new Exception("Missing records after unlock");
+                    AddPageFixtures(form);
+                    Field(form, "搜索标题或账号").Text = "分页测试";
+                    step = Step.VerifyPages;
+                }
+                else if (step == Step.VerifyPages && form.Text == main)
+                {
+                    var list = Records(form);
+                    if (list.Items.Count == 2) return;
+                    fullPageHeight = CheckPageNavigation(form);
+                    var item = list.Items[list.Items.Count - 1];
+                    item.Selected = true;
+                    savedRecordId = (long)item.Tag;
+                    if (form.ClientSize.Height != fullPageHeight) throw new Exception("Selection changed the fitted height");
+                    step = Step.SavePagedRecord;
+                    OpenSelectedDetails(list);
+                }
+                else if (step == Step.SavePagedRecord && form.Text == detail)
+                {
+                    Field(form, "便签正文").Text = "编辑分页中的记录";
+                    step = Step.VerifyPagedSave;
+                    Click(form, "保存");
+                }
+                else if (step == Step.VerifyPagedSave && form.Text == main)
+                {
+                    var list = Records(form);
+                    if (list.Items.Count != 8 || list.SelectedItems.Count != 1 || (long)list.SelectedItems[0].Tag != savedRecordId)
+                        throw new Exception("Saving the paged record did not restore its selection on an eight-row page");
+                    if (form.ClientSize.Height != fullPageHeight) throw new Exception("Saving changed the full-page height");
+                    CheckPager(form, false, true);
+                    step = Step.Done;
+                    MenuItem(Tray().ContextMenuStrip, "退出密笺").PerformClick();
+                }
+            };
+            timer.Tick += delegate {
+                try { checkStep(); }
+                catch (Exception ex)
+                {
+                    if (checkError == null) checkError = ex;
+                    throw;
                 }
             };
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
@@ -108,9 +473,11 @@ internal static class GuiChecks
             {
                 Application.Idle += delegate { if (!timer.Enabled) timer.Start(); };
                 var entry = Assembly.LoadFrom(Path.GetFullPath(args[0])).EntryPoint;
-                entry.Invoke(null, new object[] { new[] { path } });
-                if (step != 6) throw new Exception("Incomplete UI sequence at " + step);
-                Console.WriteLine("PASS app entry, setup, credential, plain note, search, masked detail, lock and reopen");
+                string[] appArgs = startInTray ? new[] { "--startup", path } : new[] { path };
+                try { entry.Invoke(null, new object[] { appArgs }); }
+                finally { if (checkError != null) throw new Exception("UI check failed at " + step, checkError); }
+                if (step != Step.Done) throw new Exception("Incomplete UI sequence at " + step);
+                Console.WriteLine("PASS app entry, compact toolbar, content height, eight rows per page, height after save, short password, notes, search, context menu, masked detail, discard, tray restore, settings, password change, lock, reopen, and exit");
             }
             finally { timer.Stop(); Directory.Delete(folder, true); }
         }
