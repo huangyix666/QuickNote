@@ -98,8 +98,42 @@ internal static class VaultChecks
                 store.Delete(id, note.Revision);
                 Require(store.Search(marker, 0, 10).Count == 0, "Delete did not persist");
             }
-            Console.WriteLine("PASS persistence, wrong password, ciphertext, conflicts, pagination, deletion");
+            CheckPasswordChange(Path.Combine(folder, "rekey.qnv"), marker);
+            Console.WriteLine("PASS persistence, wrong password, ciphertext, conflicts, pagination, deletion, password change");
         }
         finally { Directory.Delete(folder, true); }
+    }
+
+    private static void CheckPasswordChange(string file, string marker)
+    {
+        const string newPassword = "短";
+        var note = new Note { Title = "Change password", Password = marker, Body = "Original" };
+        using (var store = new Store(file, Passphrase, true))
+        {
+            store.Save(note);
+            MustFail(() => store.ChangePassword("wrong password", newPassword), "Wrong current password accepted");
+            MustFail(() => store.ChangePassword(Passphrase, ""), "Empty replacement password accepted");
+            Require(store.Get(note.Id).Body == note.Body, "Failed password change invalidated the active session");
+            using (var original = new Store(file, Passphrase, false))
+                Require(original.Get(note.Id).Password == marker, "Failed password change altered the existing vault");
+
+            using (var oldConnection = new Store(file, Passphrase, false))
+            {
+                var stale = oldConnection.Get(note.Id);
+                store.ChangePassword(Passphrase, newPassword);
+                stale.Body = "Old session write";
+                MustFail(() => oldConnection.Save(stale), "Old connection can still write after password change");
+            }
+            Require(store.Get(note.Id).Password == marker, "Password change lost existing credentials");
+            note.Body = "Updated after password change";
+            store.Save(note);
+        }
+        MustFail(() => { using (new Store(file, Passphrase, false)) {} }, "Former password still opens the vault");
+        using (var store = new Store(file, newPassword, false))
+        {
+            var reopened = store.Get(note.Id);
+            Require(reopened.Password == marker && reopened.Body == note.Body, "Password change did not preserve persisted data");
+        }
+        Require(!Encoding.UTF8.GetString(File.ReadAllBytes(file)).Contains(marker), "Password change exposed plaintext");
     }
 }

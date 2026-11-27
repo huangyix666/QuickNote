@@ -17,12 +17,14 @@ internal sealed class Store : IDisposable
     private const int Row = 100, Done = 101;
     private const int FormatId = 0x514E5631; // QNV1
     private const int KdfIterations = 600000;
+    private readonly string path;
     private IntPtr db;
 
     public Store(string path, string password, bool create)
     {
         if (String.IsNullOrEmpty(password)) throw new ArgumentException("请输入主密码。");
         path = Path.GetFullPath(path);
+        this.path = path;
         byte[] key = Encoding.UTF8.GetBytes(password);
         try
         {
@@ -82,14 +84,40 @@ internal sealed class Store : IDisposable
     private void Open(string path, byte[] key)
     {
         Check(Sqlite.sqlite3_open_v2(Utf8Z(path), out db, 2, IntPtr.Zero));
-        int cipher = Sqlite.sqlite3mc_cipher_index("chacha20");
-        if (cipher <= 0 || Sqlite.sqlite3mc_config(db, "cipher", cipher) != cipher ||
-            Sqlite.sqlite3mc_config_cipher(db, "chacha20", "kdf_iter", KdfIterations) != KdfIterations)
-            throw new InvalidOperationException("加密引擎无法应用此保险库所需的算法参数。");
+        ConfigureCipher();
         Check(Sqlite.sqlite3_key(db, key, key.Length));
         Check(Sqlite.sqlite3_busy_timeout(db, 700));
         Execute("PRAGMA temp_store=MEMORY");
         Execute("PRAGMA foreign_keys=ON");
+    }
+
+    private void ConfigureCipher()
+    {
+        int cipher = Sqlite.sqlite3mc_cipher_index("chacha20");
+        if (cipher <= 0 || Sqlite.sqlite3mc_config(db, "cipher", cipher) != cipher ||
+            Sqlite.sqlite3mc_config_cipher(db, "chacha20", "kdf_iter", KdfIterations) != KdfIterations)
+            throw new InvalidOperationException("加密引擎无法应用此保险库所需的算法参数。");
+    }
+
+    public void ChangePassword(string currentPassword, string newPassword)
+    {
+        if (db == IntPtr.Zero) throw new ObjectDisposedException("Store");
+        if (String.IsNullOrEmpty(newPassword)) throw new ArgumentException("请输入新主密码。");
+        using (var verified = new Store(path, currentPassword, false))
+        {
+            if (newPassword == currentPassword) return;
+            byte[] key = Encoding.UTF8.GetBytes(newPassword);
+            try
+            {
+                verified.ConfigureCipher();
+                verified.Check(Sqlite.sqlite3_rekey(verified.db, key, key.Length));
+                // Keep the connection that now holds the new key.
+                Dispose();
+                db = verified.db;
+                verified.db = IntPtr.Zero;
+            }
+            finally { Array.Clear(key, 0, key.Length); }
+        }
     }
 
     public List<Note> Search(string query, int offset, int limit)
@@ -286,6 +314,7 @@ internal sealed class Store : IDisposable
         private const CallingConvention C = CallingConvention.Cdecl;
         [DllImport(Dll, CallingConvention=C)] internal static extern int sqlite3_open_v2(byte[] path, out IntPtr db, int flags, IntPtr vfs);
         [DllImport(Dll, CallingConvention=C)] internal static extern int sqlite3_key(IntPtr db, byte[] key, int size);
+        [DllImport(Dll, CallingConvention=C)] internal static extern int sqlite3_rekey(IntPtr db, byte[] key, int size);
         [DllImport(Dll, CallingConvention=C)] internal static extern int sqlite3mc_cipher_index(string name);
         [DllImport(Dll, CallingConvention=C)] internal static extern int sqlite3mc_config(IntPtr db, string name, int value);
         [DllImport(Dll, CallingConvention=C)] internal static extern int sqlite3mc_config_cipher(IntPtr db, string cipher, string name, int value);
