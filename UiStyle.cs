@@ -36,6 +36,13 @@ internal static class UiStyle
         };
     }
 
+    internal static void SetToggleState(Button button, bool enabled)
+    {
+        button.Text = enabled ? "已开启" : "未开启";
+        var color = enabled ? Color.FromArgb(36, 107, 73) : Color.FromArgb(159, 52, 53);
+        ((RoundedButton)button).SetPalette(color, Color.White);
+    }
+
     internal static void FadeIn(Form form)
     {
         if (!Animate) return;
@@ -84,7 +91,7 @@ internal static class UiStyle
     {
         private const int FadeSteps = 6;
         private readonly Timer timer = new Timer { Interval = 15 };
-        private readonly Color normal, hover, pressed;
+        private Color normal, hover, pressed;
         private readonly ToolbarIcon? icon;
         private Color from, to;
         private Size regionSize;
@@ -94,20 +101,28 @@ internal static class UiStyle
         internal RoundedButton(bool primary, ToolbarIcon? icon = null)
         {
             this.icon = icon;
-            normal = primary ? Color.FromArgb(38, 87, 71) : Color.FromArgb(236, 241, 235);
-            hover = Blend(normal, primary ? Color.White : Color.Black, primary ? .12f : .06f);
-            pressed = Blend(normal, Color.Black, .16f);
-            ForeColor = primary ? Color.White : Color.FromArgb(29, 57, 48);
             Anchor = AnchorStyles.None;
             FlatStyle = FlatStyle.Flat;
             FlatAppearance.BorderSize = 0;
             UseVisualStyleBackColor = false;
-            ApplyColor(normal);
-            to = normal;
+            SetPalette(primary ? Color.FromArgb(38, 87, 71) : Color.FromArgb(236, 241, 235),
+                       primary ? Color.White : Color.FromArgb(29, 57, 48));
             timer.Tick += delegate {
                 ApplyColor(Blend(from, to, ++step / (float)FadeSteps));
                 if (step == FadeSteps) timer.Stop();
             };
+        }
+
+        internal void SetPalette(Color background, Color foreground)
+        {
+            bool dark = foreground == Color.White;
+            normal = background;
+            hover = Blend(normal, dark ? Color.White : Color.Black, dark ? .12f : .06f);
+            pressed = Blend(normal, Color.Black, .16f);
+            ForeColor = foreground;
+            timer.Stop();
+            to = !pointerInside ? normal : mouseDown ? pressed : hover;
+            ApplyColor(to);
         }
 
         protected override void OnPaint(PaintEventArgs e)

@@ -151,18 +151,27 @@ internal static class GuiChecks
 
     private static void ClickPasswordSetting(Form form)
     {
+        var bounds = form.Bounds;
         Click(form, "设置", true);
-        var menu = (ContextMenuStrip)form.GetType().GetField("settingsMenu", InstanceMembers).GetValue(form);
-        ToolStripItem changePassword;
-        try
-        {
-            var autoStart = MenuItem(menu, "开机自启动") as ToolStripMenuItem;
-            changePassword = MenuItem(menu, "更改主密码");
-            if (!menu.Visible || autoStart == null || !autoStart.Available || !changePassword.Enabled)
-                throw new Exception("Settings menu items unavailable");
-        }
-        finally { menu.Close(); }
-        changePassword.PerformClick();
+        var settings = Application.OpenForms.Cast<Form>().Single(window => window.Text == "密笺 · 设置");
+        if (settings != form || settings.Bounds != bounds || Records(form).Visible ||
+            Children(settings).OfType<Label>().Any(label => label.Visible && label.Text == "设置"))
+            throw new Exception("Settings did not replace the library in the same window");
+        var settingsScroll = Children(settings).OfType<Panel>().Single(panel => panel.Visible && panel.AutoScroll);
+        settings.ClientSize = new Size(settings.ClientSize.Width, 150);
+        settings.PerformLayout();
+        var move = Children(settings).OfType<Button>().Single(button => button.AccessibleName == "更换存储位置");
+        var change = Children(settings).OfType<Button>().Single(button => button.AccessibleName == "更改主密码");
+        var path = Children(settings).OfType<Label>().Single(label => label.AccessibleName == "当前存储位置");
+        if (move.Text != "更改" || change.Text != "更改" || path.Parent != move.Parent ||
+            path.Right > move.Left || !path.AutoEllipsis)
+            throw new Exception("The storage path and its change button are not arranged in one row");
+        settingsScroll.ScrollControlIntoView(move);
+        if (!settingsScroll.VerticalScroll.Visible || !ActionButton(settings, "返回", true).Visible ||
+            !settingsScroll.RectangleToScreen(settingsScroll.ClientRectangle).Contains(move.RectangleToScreen(move.ClientRectangle)))
+            throw new Exception("Compact settings cannot scroll to the storage action");
+        settings.Bounds = bounds;
+        change.PerformClick();
     }
 
     private static void CheckNoVaultPath(Form form, string path)
@@ -466,6 +475,10 @@ internal static class GuiChecks
                     Field(form, "新主密码").Text = Field(form, "确认新主密码").Text = newSecret;
                     step = Step.Lock;
                     Click(form, "更改主密码");
+                }
+                else if (step == Step.Lock && form.Text == "密笺 · 设置")
+                {
+                    Click(form, "返回", true);
                 }
                 else if (step == Step.Lock && form.Text == main)
                 {

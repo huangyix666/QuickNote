@@ -23,8 +23,7 @@ internal static class Program
             bool background = args.Length != 0 && args[0] == "--startup";
             int pathArg = background ? 1 : 0;
             string path = args.Length <= pathArg
-                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                               "QuickNoteVault", "vault.qnv")
+                ? VaultLocationSettings.CurrentPath
                 : Path.GetFullPath(args[pathArg]);
             using (var instance = new VaultInstance(path))
             {
@@ -207,15 +206,42 @@ internal static class StartupSettings
     }
 }
 
+internal static class VaultLocationSettings
+{
+    private const string RunKey = @"Software\QuickNoteVault";
+    private const string ValueName = "VaultPath";
+
+    internal static string CurrentPath
+    {
+        get
+        {
+            using (var key = Registry.CurrentUser.OpenSubKey(RunKey))
+            {
+                string saved = key == null ? null : key.GetValue(ValueName) as string;
+                if (!String.IsNullOrWhiteSpace(saved)) return Path.GetFullPath(saved);
+            }
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                               "QuickNoteVault", "vault.qnv");
+        }
+    }
+
+    internal static void Set(string path)
+    {
+        using (var key = Registry.CurrentUser.CreateSubKey(RunKey))
+            key.SetValue(ValueName, Path.GetFullPath(path), RegistryValueKind.String);
+    }
+}
+
 internal sealed class VaultSession : ApplicationContext
 {
-    private readonly string path;
+    private string path;
     private readonly NotifyIcon tray = new NotifyIcon();
     private readonly ContextMenuStrip trayMenu = new ContextMenuStrip();
     private MainForm window;
     private UnlockForm unlockWindow;
     private Store store;
     private bool locking;
+    private string oldPathAfterMove;
 
     internal VaultSession(string path)
     {
@@ -273,16 +299,53 @@ internal sealed class VaultSession : ApplicationContext
         }
         window = new MainForm(store);
         window.LockRequested += delegate { LockVault(); };
+        window.StorageMoved += StorageMoved;
         window.FormClosed += delegate {
             window = null;
             store.Dispose();
             store = null;
+            if (!String.IsNullOrEmpty(oldPathAfterMove))
+            {
+                string oldPath = oldPathAfterMove;
+                oldPathAfterMove = null;
+                if (MessageBox.Show("新位置已经验证成功。是否删除旧资料库？\n\n" + oldPath,
+                    "清理旧位置", MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+                    MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                    DeleteVaultFiles(oldPath);
+            }
             if (locking) ShowLockedTray();
             else ExitThread();
+            locking = false;
         };
         tray.Text = "密笺";
         tray.Visible = true;
         window.RestoreWindow();
+    }
+
+    private void StorageMoved(object sender, StorageMovedEventArgs e)
+    {
+        string previous = path;
+        try { VaultLocationSettings.Set(e.NewPath); }
+        catch (Exception ex)
+        {
+            MessageBox.Show("新资料库已经复制成功，但无法保存默认位置。\n" + ex.Message,
+                "更换存储位置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        path = e.NewPath;
+        oldPathAfterMove = previous;
+        locking = true;
+        var currentWindow = sender as MainForm;
+        if (currentWindow != null)
+            currentWindow.BeginInvoke(new Action(delegate { if (window != null) window.CloseSession(); }));
+    }
+
+    private static void DeleteVaultFiles(string path)
+    {
+        foreach (string file in new[] { path, path + "-wal", path + "-shm", path + "-journal" })
+            try { if (File.Exists(file)) File.Delete(file); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
     }
 
     private void ExitVault()

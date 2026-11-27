@@ -20,6 +20,8 @@ internal sealed class Store : IDisposable
     private readonly string path;
     private IntPtr db;
 
+    internal string FilePath { get { return path; } }
+
     public Store(string path, string password, bool create)
     {
         if (String.IsNullOrEmpty(password)) throw new ArgumentException("请输入主密码。");
@@ -78,6 +80,78 @@ internal sealed class Store : IDisposable
         {
             Dispose(); // Closing also rolls back incomplete schema creation.
             if (File.Exists(staging)) File.Delete(staging);
+        }
+    }
+
+    internal static void CloneVerified(string sourcePath, string targetPath, string password)
+    {
+        if (String.IsNullOrEmpty(password)) throw new ArgumentException("请输入主密码。");
+        sourcePath = Path.GetFullPath(sourcePath);
+        targetPath = Path.GetFullPath(targetPath);
+        if (String.Equals(sourcePath, targetPath, StringComparison.OrdinalIgnoreCase))
+            throw new IOException("新位置必须与当前资料库不同。");
+        if (!File.Exists(sourcePath)) throw new FileNotFoundException("当前资料库不存在。", sourcePath);
+        if (File.Exists(targetPath))
+        {
+            if (!FilesEqual(sourcePath, targetPath))
+                throw new IOException("目标位置已有其他资料库，请选择其他位置。");
+            VerifyClone(targetPath, password);
+            return;
+        }
+
+        string directory = Path.GetDirectoryName(targetPath);
+        Directory.CreateDirectory(directory);
+        string staging = targetPath + ".moving";
+        try
+        {
+            if (File.Exists(staging)) File.Delete(staging);
+            File.Copy(sourcePath, staging, false);
+            using (FileStream stream = new FileStream(staging, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+                stream.Flush(true);
+
+            VerifyClone(staging, password);
+            File.Move(staging, targetPath);
+        }
+        finally
+        {
+            if (File.Exists(staging)) File.Delete(staging);
+        }
+    }
+
+    private static void VerifyClone(string path, string password)
+    {
+        using (Store verified = new Store(path, password, false))
+        {
+            List<Note> sample = verified.Search("", 0, 1);
+            if (sample.Count > 0 && verified.Get(sample[0].Id) == null)
+                throw new InvalidDataException("目标资料库校验失败。");
+        }
+    }
+
+    private static bool FilesEqual(string left, string right)
+    {
+        var leftInfo = new FileInfo(left);
+        var rightInfo = new FileInfo(right);
+        if (leftInfo.Length != rightInfo.Length) return false;
+        using (var first = new FileStream(left, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        using (var second = new FileStream(right, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            byte[] a = new byte[65536];
+            byte[] b = new byte[65536];
+            int read;
+            while ((read = first.Read(a, 0, a.Length)) > 0)
+            {
+                int offset = 0;
+                while (offset < read)
+                {
+                    int count = second.Read(b, offset, read - offset);
+                    if (count == 0) return false;
+                    offset += count;
+                }
+                for (int i = 0; i < read; i++)
+                    if (a[i] != b[i]) return false;
+            }
+            return second.ReadByte() == -1;
         }
     }
 

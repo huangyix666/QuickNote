@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
@@ -14,18 +15,21 @@ internal sealed class MainForm : Form
     private readonly Button previous = UiStyle.IconButton(UiStyle.ToolbarIcon.Previous, "上一页", size: 24);
     private readonly Button next = UiStyle.IconButton(UiStyle.ToolbarIcon.Next, "下一页", size: 24);
     private readonly ContextMenuStrip recordMenu = new ContextMenuStrip();
-    private readonly ContextMenuStrip settingsMenu = new ContextMenuStrip();
     private readonly ToolTip toolbarTips = new ToolTip();
     private readonly Timer searchDelay = new Timer { Interval = 150 };
     private readonly Timer clipboardExpiry = new Timer { Interval = 30000 };
+    private TableLayoutPanel libraryPane;
+    private TableLayoutPanel settingsPane;
     private Form dialog;
     private int offset;
     private bool closingSession;
     private uint copiedSequence;
     private Label copyStatus;
     private string copyMessage;
+    private bool settingsVisible;
 
     internal event EventHandler LockRequested;
+    internal event EventHandler<StorageMovedEventArgs> StorageMoved;
     internal bool HasOpenDialog { get { return dialog != null; } }
 
     [DllImport("user32.dll")]
@@ -41,9 +45,9 @@ internal sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(260, 140);
 
-        var pane = VaultLayout.Grid();
-        pane.Padding = new Padding(8, 4, 8, 4);
-        Controls.Add(pane);
+        libraryPane = VaultLayout.Grid();
+        libraryPane.Padding = new Padding(8, 4, 8, 4);
+        Controls.Add(libraryPane);
 
         var toolbar = VaultLayout.Actions(3);
         query.Margin = new Padding(0, 2, 6, 2);
@@ -63,37 +67,9 @@ internal sealed class MainForm : Form
         toolbar.Controls.Add(add, 1, 0);
         toolbar.Controls.Add(lockButton, 2, 0);
         toolbar.Controls.Add(settingsButton, 3, 0);
-        VaultLayout.Row(pane, toolbar, 34);
+        VaultLayout.Row(libraryPane, toolbar, 34);
 
-        settingsMenu.Items.Add("更改主密码", null, delegate { ChangePassword(); });
-        var autoStart = new ToolStripMenuItem("开机自启动");
-        settingsMenu.Items.Add(autoStart);
-        settingsMenu.Opening += delegate {
-            try
-            {
-                autoStart.Checked = StartupSettings.Enabled;
-                autoStart.Enabled = true;
-            }
-            catch
-            {
-                autoStart.Checked = false;
-                autoStart.Enabled = false;
-                status.Text = "无法读取自启动设置";
-            }
-        };
-        autoStart.Click += delegate {
-            try
-            {
-                bool enabled = !autoStart.Checked;
-                StartupSettings.Enabled = enabled;
-                autoStart.Checked = enabled;
-                status.Text = enabled ? "已开启自启动" : "已关闭自启动";
-            }
-            catch (Exception ex) { Report("设置失败", ex); }
-        };
-        settingsButton.Click += delegate {
-            settingsMenu.Show(settingsButton, new Point(settingsButton.Width, settingsButton.Height), ToolStripDropDownDirection.BelowLeft);
-        };
+        settingsButton.Click += delegate { OpenSettings(); };
 
         list.Dock = DockStyle.Fill;
         list.View = View.Details;
@@ -111,7 +87,7 @@ internal sealed class MainForm : Form
             list.Columns[0].Width = (int)(usable * .55);
             list.Columns[1].Width = usable - list.Columns[0].Width;
         };
-        VaultLayout.Row(pane, list, 0);
+        VaultLayout.Row(libraryPane, list, 0);
 
         var pages = VaultLayout.Grid(3);
         pages.RowCount = 1;
@@ -131,7 +107,7 @@ internal sealed class MainForm : Form
         pages.Controls.Add(footerCenter, 0, 0);
         pages.Controls.Add(previous, 1, 0);
         pages.Controls.Add(next, 2, 0);
-        VaultLayout.Row(pane, pages, 28);
+        VaultLayout.Row(libraryPane, pages, 28);
 
         recordMenu.Items.Add("复制账号", null, delegate { CopySelected(false); });
         recordMenu.Items.Add("复制密码", null, delegate { CopySelected(true); });
@@ -240,7 +216,6 @@ internal sealed class MainForm : Form
 
     private void ChangePassword()
     {
-        if (HasOpenDialog) return;
         if (searchDelay.Enabled)
         {
             searchDelay.Stop();
@@ -250,11 +225,148 @@ internal sealed class MainForm : Form
             if (ShowOwnedDialog(change) == DialogResult.OK) status.Text = "主密码已更改";
     }
 
+    private void OpenSettings()
+    {
+        if (HasOpenDialog || settingsVisible) return;
+        settingsVisible = true;
+        Text = "密笺 · 设置";
+        libraryPane.Visible = false;
+        settingsPane = BuildSettingsPane();
+        Controls.Add(settingsPane);
+        settingsPane.BringToFront();
+        settingsPane.Focus();
+    }
+
+    private TableLayoutPanel BuildSettingsPane()
+    {
+        var pane = VaultLayout.Grid();
+        pane.Padding = new Padding(12, 6, 12, 8);
+        var header = VaultLayout.Grid();
+        var back = UiStyle.IconButton(UiStyle.ToolbarIcon.Previous, "返回", size: 26);
+        back.Anchor = AnchorStyles.Left;
+        back.Margin = Padding.Empty;
+        toolbarTips.SetToolTip(back, "返回");
+        back.Click += delegate { CloseSettings(); };
+        header.Controls.Add(back, 0, 0);
+        VaultLayout.Row(pane, header, 38);
+
+        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Margin = Padding.Empty };
+        var content = VaultLayout.Grid();
+        content.Dock = DockStyle.Top;
+        content.AutoSize = true;
+        content.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        scroll.Controls.Add(content);
+        VaultLayout.Row(pane, scroll, 0);
+
+        var autoStart = UiStyle.ActionButton("不可用");
+        autoStart.AccessibleName = "开机自启动";
+        try { UiStyle.SetToggleState(autoStart, StartupSettings.Enabled); }
+        catch { autoStart.Enabled = false; }
+        autoStart.Click += delegate {
+            try
+            {
+                bool enabled = !StartupSettings.Enabled;
+                StartupSettings.Enabled = enabled;
+                UiStyle.SetToggleState(autoStart, enabled);
+            }
+            catch (Exception ex) { Report("设置失败", ex); }
+        };
+        VaultLayout.Row(content, SettingsRow("开机自启动", autoStart), 46);
+        VaultLayout.Row(content, new Panel { Margin = Padding.Empty }, 5);
+
+        var change = UiStyle.ActionButton("更改");
+        change.AccessibleName = "更改主密码";
+        change.Click += delegate { ChangePassword(); };
+        VaultLayout.Row(content, SettingsRow("主密码", change), 46);
+        VaultLayout.Row(content, new Panel { Margin = Padding.Empty }, 5);
+
+        var path = VaultLayout.Caption(store.FilePath, 9);
+        path.AccessibleName = "当前存储位置";
+        path.ForeColor = Color.FromArgb(59, 78, 70);
+        path.Margin = new Padding(8, 0, 4, 0);
+        toolbarTips.SetToolTip(path, store.FilePath);
+        var move = UiStyle.ActionButton("更改");
+        move.AccessibleName = "更换存储位置";
+        move.Click += delegate {
+            using (var folder = new FolderBrowserDialog {
+                Description = "选择新的资料库存储文件夹",
+                SelectedPath = Path.GetDirectoryName(store.FilePath)
+            })
+            {
+                if (folder.ShowDialog(this) != DialogResult.OK) return;
+                string target = Path.Combine(folder.SelectedPath, Path.GetFileName(store.FilePath));
+                if (String.Equals(target, store.FilePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    Report("更换存储位置", new IOException("新位置必须与当前资料库不同。"));
+                    return;
+                }
+                if (MessageBox.Show(this, "资料库会先复制并校验到新位置。旧资料库会保留，待新位置重新打开后再询问是否删除。\n\n" + target,
+                    "确认更换存储位置", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
+                try
+                {
+                    if (MoveStorage(target) && StorageMoved != null)
+                        StorageMoved(this, new StorageMovedEventArgs(target));
+                }
+                catch (Exception ex) { Report("迁移失败", ex); }
+            }
+        };
+        VaultLayout.Row(content, SettingsRow("存储位置", move, path), 46);
+        return pane;
+    }
+
+    private static TableLayoutPanel SettingsRow(string title, Control action, Label detail = null)
+    {
+        var row = VaultLayout.Grid(detail == null ? 2 : 3);
+        row.BackColor = Color.White;
+        row.Padding = new Padding(10, 0, 8, 0);
+        var label = VaultLayout.Caption(title, 10, true);
+        if (detail != null)
+        {
+            label.AutoSize = true;
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            row.Controls.Add(detail, 1, 0);
+        }
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        row.Controls.Add(label, 0, 0);
+        row.Controls.Add(action, row.ColumnCount - 1, 0);
+        return row;
+    }
+
+    private void CloseSettings()
+    {
+        if (!settingsVisible) return;
+        settingsVisible = false;
+        if (settingsPane != null)
+        {
+            Controls.Remove(settingsPane);
+            settingsPane.Dispose();
+            settingsPane = null;
+        }
+        Text = "密笺 · 资料库";
+        libraryPane.Visible = true;
+        libraryPane.BringToFront();
+        RefreshList(offset, SelectedId);
+    }
+
+    private bool MoveStorage(string targetPath)
+    {
+        using (var prompt = new SecretPromptForm("验证主密码"))
+        {
+            if (prompt.ShowDialog(dialog ?? this) != DialogResult.OK) return false;
+            Store.CloneVerified(store.FilePath, targetPath, prompt.Password);
+            return true;
+        }
+    }
+
     private DialogResult ShowOwnedDialog(Form form)
     {
+        Form owner = dialog ?? this;
+        Form previous = dialog;
         dialog = form;
-        try { return form.ShowDialog(this); }
-        finally { dialog = null; }
+        try { return form.ShowDialog(owner); }
+        finally { dialog = previous; }
     }
 
     private void CopySelected(bool secret)
@@ -361,10 +473,51 @@ internal sealed class MainForm : Form
             searchDelay.Dispose();
             clipboardExpiry.Dispose();
             recordMenu.Dispose();
-            settingsMenu.Dispose();
             toolbarTips.Dispose();
         }
         base.Dispose(disposing);
+    }
+}
+
+internal sealed class StorageMovedEventArgs : EventArgs
+{
+    internal readonly string NewPath;
+    internal StorageMovedEventArgs(string newPath) { NewPath = newPath; }
+}
+
+internal sealed class SecretPromptForm : Form
+{
+    private readonly TextBox password = new TextBox { UseSystemPasswordChar = true, Dock = DockStyle.Fill };
+    internal string Password { get { return password.Text; } }
+
+    internal SecretPromptForm(string title)
+    {
+        Text = title;
+        Icon = UiStyle.AppIcon;
+        StartPosition = FormStartPosition.CenterParent;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        ShowInTaskbar = false;
+        ClientSize = new Size(360, 150);
+        var grid = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(18), RowCount = 3, ColumnCount = 1 };
+        grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        grid.Controls.Add(new Label { Text = "请输入当前主密码以验证迁移操作。", Dock = DockStyle.Fill }, 0, 0);
+        grid.Controls.Add(password, 0, 1);
+        var ok = UiStyle.ActionButton("继续", true);
+        ok.DialogResult = DialogResult.OK;
+        var cancel = UiStyle.ActionButton("取消");
+        cancel.DialogResult = DialogResult.Cancel;
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft };
+        buttons.Controls.Add(ok);
+        buttons.Controls.Add(cancel);
+        grid.Controls.Add(buttons, 0, 2);
+        Controls.Add(grid);
+        AcceptButton = ok;
+        CancelButton = cancel;
+        Shown += delegate { password.Focus(); };
     }
 }
 

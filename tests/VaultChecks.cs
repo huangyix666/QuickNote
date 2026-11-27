@@ -99,7 +99,13 @@ internal static class VaultChecks
                 Require(store.Search(marker, 0, 10).Count == 0, "Delete did not persist");
             }
             CheckPasswordChange(Path.Combine(folder, "rekey.qnv"), marker);
-            Console.WriteLine("PASS persistence, wrong password, ciphertext, conflicts, pagination, deletion, password change");
+            string migrated = Path.Combine(folder, "migrated", "vault.qnv");
+            string source = Path.Combine(folder, "rekey.qnv");
+            Store.CloneVerified(source, migrated, "短");
+            Store.CloneVerified(source, migrated, "短");
+            using (var copied = new Store(migrated, "短", false))
+                Require(copied.Search("", 0, 1).Count == 1, "Verified clone cannot be reopened");
+            Console.WriteLine("PASS persistence, wrong password, ciphertext, conflicts, pagination, deletion, password change, resumable clone");
         }
         finally { Directory.Delete(folder, true); }
     }
