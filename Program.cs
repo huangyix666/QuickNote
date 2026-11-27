@@ -33,7 +33,7 @@ internal static class Program
                 {
                     instance.Listen(delegate { session.OpenVault(); });
                     if (background) session.ShowLockedTray();
-                    else if (!session.OpenVault()) return;
+                    else session.OpenVault();
                     Application.Run(session);
                 }
             }
@@ -43,6 +43,37 @@ internal static class Program
             MessageBox.Show("无法打开资料库。\n" + ex.Message, "密笺", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
+}
+
+internal static class WindowVisibility
+{
+    private const int Show = 5;
+    private const int Restore = 9;
+
+    internal static void EnsureShown(Form form)
+    {
+        if (!form.Visible) form.Show();
+        if (form.WindowState == FormWindowState.Minimized)
+            form.WindowState = FormWindowState.Normal;
+
+        IntPtr handle = form.Handle;
+        if (IsIconic(handle)) ShowWindow(handle, Restore);
+        if (!IsWindowVisible(handle))
+        {
+            // A hidden startup can override the first native show without updating Form.Visible.
+            ShowWindow(handle, Show);
+            if (!IsWindowVisible(handle)) ShowWindow(handle, Show);
+        }
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr window, int command);
 }
 
 internal sealed class VaultInstance : IDisposable
@@ -184,7 +215,7 @@ internal sealed class VaultSession : ApplicationContext
     private MainForm window;
     private UnlockForm unlockWindow;
     private Store store;
-    private bool unlocking, locking;
+    private bool locking;
 
     internal VaultSession(string path)
     {
@@ -192,22 +223,23 @@ internal sealed class VaultSession : ApplicationContext
         var open = trayMenu.Items.Add("打开密笺", null, delegate { OpenVault(); });
         var lockItem = trayMenu.Items.Add("锁定资料库", null, delegate { LockVault(); });
         trayMenu.Items.Add(new ToolStripSeparator());
-        var exit = trayMenu.Items.Add("退出密笺", null, delegate {
-            if (window == null) ExitThread();
-            else window.CloseSession();
-        });
+        var exit = trayMenu.Items.Add("退出密笺", null, delegate { ExitVault(); });
         trayMenu.Opening += delegate {
-            bool available = !unlocking && !locking;
-            open.Enabled = available;
-            lockItem.Enabled = available && window != null && !window.HasOpenDialog;
-            exit.Enabled = available && (window == null || !window.HasOpenDialog);
+            open.Enabled = !locking;
+            lockItem.Enabled = !locking && window != null && !window.HasOpenDialog;
+            exit.Enabled = !locking && (window == null || !window.HasOpenDialog)
+                && (unlockWindow == null || !unlockWindow.IsOpening);
         };
         tray.Icon = UiStyle.AppIcon;
         tray.Text = "密笺";
         tray.ContextMenuStrip = trayMenu;
-        tray.MouseDoubleClick += delegate(object sender, MouseEventArgs e) {
-            if (e.Button == MouseButtons.Left) OpenVault();
-        };
+        tray.MouseClick += OpenFromTray;
+        tray.MouseDoubleClick += OpenFromTray;
+    }
+
+    private void OpenFromTray(object sender, MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left) OpenVault();
     }
 
     internal void ShowLockedTray()
@@ -216,45 +248,57 @@ internal sealed class VaultSession : ApplicationContext
         tray.Visible = true;
     }
 
-    internal bool OpenVault()
+    internal void OpenVault()
     {
-        if (window != null) { window.RestoreWindow(); return true; }
+        if (locking) return;
+        if (window != null) { window.RestoreWindow(); return; }
+        if (unlockWindow == null)
+        {
+            unlockWindow = new UnlockForm(path);
+            unlockWindow.FormClosed += UnlockClosed;
+        }
+        WindowVisibility.EnsureShown(unlockWindow);
+        unlockWindow.Activate();
+    }
+
+    private void UnlockClosed(object sender, FormClosedEventArgs e)
+    {
+        var unlock = (UnlockForm)sender;
+        unlockWindow = null;
+        store = unlock.OpenedStore;
+        if (store == null)
+        {
+            if (!tray.Visible) ExitThread();
+            return;
+        }
+        window = new MainForm(store);
+        window.LockRequested += delegate { LockVault(); };
+        window.FormClosed += delegate {
+            window = null;
+            store.Dispose();
+            store = null;
+            if (locking) ShowLockedTray();
+            else ExitThread();
+        };
+        tray.Text = "密笺";
+        tray.Visible = true;
+        window.RestoreWindow();
+    }
+
+    private void ExitVault()
+    {
+        if (locking) return;
+        if (window != null)
+        {
+            if (!window.HasOpenDialog) window.CloseSession();
+            return;
+        }
         if (unlockWindow != null)
         {
-            if (unlockWindow.WindowState == FormWindowState.Minimized)
-                unlockWindow.WindowState = FormWindowState.Normal;
-            unlockWindow.Activate();
-            return false;
+            if (unlockWindow.IsOpening) return;
+            unlockWindow.Close();
         }
-        if (unlocking || locking) return false;
-        unlocking = true;
-        try
-        {
-            using (var unlock = new UnlockForm(path))
-            {
-                unlockWindow = unlock;
-                try
-                {
-                    if (unlock.ShowDialog() != DialogResult.OK) return false;
-                    store = unlock.OpenedStore;
-                }
-                finally { unlockWindow = null; }
-            }
-            window = new MainForm(store);
-            window.LockRequested += delegate { LockVault(); };
-            window.FormClosed += delegate {
-                window = null;
-                store.Dispose();
-                store = null;
-                if (locking) ShowLockedTray();
-                else ExitThread();
-            };
-            tray.Text = "密笺";
-            tray.Visible = true;
-            window.Show();
-            return true;
-        }
-        finally { unlocking = false; }
+        ExitThread();
     }
 
     private void LockVault()
@@ -272,6 +316,7 @@ internal sealed class VaultSession : ApplicationContext
             tray.Visible = false;
             tray.Dispose();
             trayMenu.Dispose();
+            if (unlockWindow != null) unlockWindow.Dispose();
             if (window != null) window.Dispose();
             if (store != null) store.Dispose();
         }
@@ -282,6 +327,7 @@ internal sealed class VaultSession : ApplicationContext
 internal sealed class UnlockForm : Form
 {
     internal Store OpenedStore { get; private set; }
+    internal bool IsOpening { get { return opening; } }
     private readonly string vaultPath;
     private readonly Store changingStore;
     private readonly bool creating;
@@ -410,7 +456,8 @@ internal sealed class UnlockForm : Form
             password.Clear();
             newPassword.Clear();
             confirm.Clear();
-            DialogResult = DialogResult.OK;
+            if (changing) DialogResult = DialogResult.OK;
+            else Close();
         }
         else
         {

@@ -14,11 +14,15 @@ internal static class GuiChecks
     [DllImport("user32.dll")]
     private static extern uint GetClipboardSequenceNumber();
 
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr window);
+
     private enum Step
     {
         StartInTray, Setup, AddCredential, SaveCredential, VerifyCredential, SaveNote, Search, OpenDetails,
-        CheckDetails, CancelDiscard, ConfirmDiscard, Discard, Hide, ChangePassword,
-        SavePassword, Lock, UnlockFromTray, EnterPassword, SeedPages, VerifyPages, SavePagedRecord, VerifyPagedSave, Done
+        CheckDetails, CancelDiscard, ConfirmDiscard, Discard, Hide, CheckRepeatLaunch, ChangePassword,
+        SavePassword, Lock, UnlockFromTray, CheckUnlockRestore, EnterPassword, SeedPages,
+        VerifyPages, SavePagedRecord, VerifyPagedSave, ShowExitPrompt, ExitWithPrompt, Done
     }
 
     private static IEnumerable<Control> Children(Control parent)
@@ -95,7 +99,7 @@ internal static class GuiChecks
     private static void CheckPageRecords(ListView list, int newest, int oldest)
     {
         if (list.Items.Count != newest - oldest + 1)
-            throw new Exception("The page does not show the expected number of records");
+            throw new Exception("Expected records " + newest + " through " + oldest + ", but found " + list.Items.Count + " rows");
         for (int i = 0; i < list.Items.Count; i++)
             if (list.Items[i].Text != "分页测试 " + (newest - i).ToString("D3"))
                 throw new Exception("The page does not show the expected records in order");
@@ -106,25 +110,27 @@ internal static class GuiChecks
         var list = Records(form);
         CheckPageRecords(list, 17, 10);
         CheckPager(form, false, true);
+        if (list.GetItemRect(7).Bottom > list.ClientSize.Height)
+            throw new Exception("The default window height clips the eighth record");
         int fullPageHeight = form.ClientSize.Height;
 
         Click(form, "下一页", true);
         CheckPageRecords(list, 9, 2);
         CheckPager(form, true, true);
         if (form.ClientSize.Height != fullPageHeight)
-            throw new Exception("The second full page changed the fitted height");
+            throw new Exception("The second full page changed the window height");
 
         Click(form, "下一页", true);
         CheckPageRecords(list, 1, 1);
         CheckPager(form, true, false);
-        if (form.ClientSize.Height >= fullPageHeight)
-            throw new Exception("The window did not shrink for the last page");
+        if (form.ClientSize.Height != fullPageHeight)
+            throw new Exception("The last page changed the window height");
 
         Click(form, "上一页", true);
         CheckPageRecords(list, 9, 2);
         CheckPager(form, true, true);
         if (form.ClientSize.Height != fullPageHeight)
-            throw new Exception("Returning to a full page did not restore the fitted height");
+            throw new Exception("Returning to a full page changed the window height");
         return fullPageHeight;
     }
 
@@ -209,11 +215,30 @@ internal static class GuiChecks
         return tray;
     }
 
-    private static void OpenFromTray()
+    private static void OpenFromTray(bool doubleClick = false)
     {
         var tray = Tray();
-        typeof(NotifyIcon).GetMethod("OnMouseDoubleClick", InstanceMembers).Invoke(tray,
-            new object[] { new MouseEventArgs(MouseButtons.Left, 2, 0, 0, 0) });
+        string handler = doubleClick ? "OnMouseDoubleClick" : "OnMouseClick";
+        typeof(NotifyIcon).GetMethod(handler, InstanceMembers).Invoke(tray,
+            new object[] { new MouseEventArgs(MouseButtons.Left, doubleClick ? 2 : 1, 0, 0, 0) });
+    }
+
+    private static void ClickTrayMenu(string name, bool withUnlockPrompt = false)
+    {
+        var tray = Tray();
+        var menu = tray.ContextMenuStrip;
+        typeof(NotifyIcon).GetMethod("ShowContextMenu", InstanceMembers).Invoke(tray, null);
+        ToolStripItem action;
+        try
+        {
+            action = MenuItem(menu, name);
+            if (!menu.Visible || !action.Enabled)
+                throw new Exception("Tray menu action unavailable: " + name);
+            if (withUnlockPrompt && (!MenuItem(menu, "打开密笺").Enabled || !MenuItem(menu, "退出密笺").Enabled))
+                throw new Exception("An open unlock prompt disabled the tray menu");
+        }
+        finally { menu.Close(); }
+        action.PerformClick();
     }
 
     private static uint AssertClipboard(Action copy, string expected)
@@ -271,13 +296,15 @@ internal static class GuiChecks
         string folder = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(),
             "vault-ui-" + Guid.NewGuid().ToString("N"))).FullName;
         string path = Path.Combine(folder, "smoke.qnv");
+        string appExe = Path.GetFullPath(args[0]);
         var clock = Stopwatch.StartNew();
         bool startInTray = args.Length == 2 && args[1] == "--startup";
         Step step = startInTray ? Step.StartInTray : Step.Setup;
-        int emptyHeight = 0;
-        int oneRecordHeight = 0;
+        int initialHeight = 0;
         int fullPageHeight = 0;
         long savedRecordId = 0;
+        Form minimizedUnlock = null;
+        Process repeatedLaunch = null;
         const string secret = "初";
         const string newSecret = "新";
         const string main = "密笺 · 资料库";
@@ -301,8 +328,14 @@ internal static class GuiChecks
                 if (step == Step.UnlockFromTray)
                 {
                     if (form != null) throw new Exception("Lock left a vault window visible");
-                    step = Step.EnterPassword;
-                    OpenFromTray();
+                    step = Step.CheckUnlockRestore;
+                    OpenFromTray(true);
+                }
+                else if (step == Step.ShowExitPrompt)
+                {
+                    if (form != null) throw new Exception("Lock left the main window visible before exit");
+                    step = Step.ExitWithPrompt;
+                    ClickTrayMenu("打开密笺");
                 }
                 if (form == null) return;
 
@@ -317,7 +350,7 @@ internal static class GuiChecks
                 {
                     CheckCompactLibrary(form);
                     CheckPager(form, false, false);
-                    emptyHeight = form.ClientSize.Height;
+                    initialHeight = form.ClientSize.Height;
                     step = Step.SaveCredential;
                     Click(form, "新建", true);
                 }
@@ -335,7 +368,8 @@ internal static class GuiChecks
                     var list = Records(form);
                     if (list.Items.Count != 1) throw new Exception("Save did not publish a row");
                     CheckPager(form, false, false);
-                    oneRecordHeight = form.ClientSize.Height;
+                    if (form.ClientSize.Height != initialHeight)
+                        throw new Exception("Adding a record changed the window height");
                     step = Step.SaveNote;
                     Click(form, "新建", true);
                 }
@@ -350,8 +384,8 @@ internal static class GuiChecks
                 {
                     var list = Records(form);
                     if (list.Items.Count != 2) throw new Exception("Plain note did not publish a row");
-                    if (form.ClientSize.Height <= emptyHeight || form.ClientSize.Height <= oneRecordHeight)
-                        throw new Exception("The library height did not increase for additional records");
+                    if (form.ClientSize.Height != initialHeight)
+                        throw new Exception("Adding a second record changed the window height");
                     CheckPager(form, false, false);
                     list.Items.Cast<ListViewItem>().Single(item => item.Text == "无账号便签").Selected = true;
                     CheckCopyMenu(list, list.Items.Cast<ListViewItem>().Single(item => item.Text == "测试账号"));
@@ -362,6 +396,8 @@ internal static class GuiChecks
                 {
                     var list = Records(form);
                     if (list.Items.Count != 1 || list.Items[0].Text != "测试账号") return;
+                    if (form.ClientSize.Height != initialHeight)
+                        throw new Exception("Filtering records changed the window height");
                     list.Items[0].Selected = true;
                     step = Step.CheckDetails;
                     OpenSelectedDetails(list);
@@ -395,9 +431,28 @@ internal static class GuiChecks
                 {
                     form.Close();
                     if (form.Visible || form.IsDisposed) throw new Exception("Close did not hide the vault");
-                    MenuItem(Tray().ContextMenuStrip, "打开密笺").PerformClick();
+                    ClickTrayMenu("打开密笺");
                     if (!form.Visible || Field(form, "搜索标题或账号").Text != "ui-lab" || Records(form).SelectedItems.Count != 1)
                         throw new Exception("Restore did not preserve the search and selection");
+                    form.WindowState = FormWindowState.Minimized;
+                    ClickTrayMenu("打开密笺");
+                    if (form.WindowState != FormWindowState.Normal)
+                        throw new Exception("Tray Open did not restore the minimized library window");
+                    form.WindowState = FormWindowState.Minimized;
+                    repeatedLaunch = Process.Start(new ProcessStartInfo(appExe, "\"" + path + "\"") {
+                        UseShellExecute = false
+                    });
+                    step = Step.CheckRepeatLaunch;
+                }
+                else if (step == Step.CheckRepeatLaunch && form.Text == main)
+                {
+                    if (!repeatedLaunch.HasExited || form.WindowState != FormWindowState.Normal) return;
+                    if (repeatedLaunch.ExitCode != 0)
+                        throw new Exception("The repeated launch exited with code " + repeatedLaunch.ExitCode);
+                    if (!IsWindowVisible(form.Handle))
+                        throw new Exception("The original library window remained hidden after a repeated launch");
+                    if (Field(form, "搜索标题或账号").Text != "ui-lab" || Records(form).SelectedItems.Count != 1)
+                        throw new Exception("A repeated launch did not preserve the original search and selection");
                     step = Step.ChangePassword;
                 }
                 else if (step == Step.ChangePassword && form.Text == main)
@@ -417,8 +472,17 @@ internal static class GuiChecks
                     step = Step.UnlockFromTray;
                     Click(form, "锁定", true);
                 }
+                else if (step == Step.CheckUnlockRestore && form.Text == "密笺 · 解锁资料库")
+                {
+                    minimizedUnlock = form;
+                    form.WindowState = FormWindowState.Minimized;
+                    step = Step.EnterPassword;
+                    ClickTrayMenu("打开密笺", true);
+                }
                 else if (step == Step.EnterPassword && form.Text == "密笺 · 解锁资料库")
                 {
+                    if (form != minimizedUnlock || form.WindowState != FormWindowState.Normal || !IsWindowVisible(form.Handle))
+                        throw new Exception("Tray Open did not restore the same minimized unlock prompt");
                     CheckNoVaultPath(form, path);
                     Field(form, "主密码").Text = newSecret;
                     step = Step.SeedPages;
@@ -436,10 +500,12 @@ internal static class GuiChecks
                     var list = Records(form);
                     if (list.Items.Count == 2) return;
                     fullPageHeight = CheckPageNavigation(form);
+                    if (fullPageHeight != initialHeight)
+                        throw new Exception("Filling a page changed the initial window height");
                     var item = list.Items[list.Items.Count - 1];
                     item.Selected = true;
                     savedRecordId = (long)item.Tag;
-                    if (form.ClientSize.Height != fullPageHeight) throw new Exception("Selection changed the fitted height");
+                    if (form.ClientSize.Height != fullPageHeight) throw new Exception("Selection changed the window height");
                     step = Step.SavePagedRecord;
                     OpenSelectedDetails(list);
                 }
@@ -456,8 +522,13 @@ internal static class GuiChecks
                         throw new Exception("Saving the paged record did not restore its selection on an eight-row page");
                     if (form.ClientSize.Height != fullPageHeight) throw new Exception("Saving changed the full-page height");
                     CheckPager(form, false, true);
+                    step = Step.ShowExitPrompt;
+                    Click(form, "锁定", true);
+                }
+                else if (step == Step.ExitWithPrompt && form.Text == "密笺 · 解锁资料库")
+                {
                     step = Step.Done;
-                    MenuItem(Tray().ContextMenuStrip, "退出密笺").PerformClick();
+                    ClickTrayMenu("退出密笺", true);
                 }
             };
             timer.Tick += delegate {
@@ -472,14 +543,29 @@ internal static class GuiChecks
             try
             {
                 Application.Idle += delegate { if (!timer.Enabled) timer.Start(); };
-                var entry = Assembly.LoadFrom(Path.GetFullPath(args[0])).EntryPoint;
+                var entry = Assembly.LoadFrom(appExe).EntryPoint;
                 string[] appArgs = startInTray ? new[] { "--startup", path } : new[] { path };
                 try { entry.Invoke(null, new object[] { appArgs }); }
                 finally { if (checkError != null) throw new Exception("UI check failed at " + step, checkError); }
                 if (step != Step.Done) throw new Exception("Incomplete UI sequence at " + step);
-                Console.WriteLine("PASS app entry, compact toolbar, content height, eight rows per page, height after save, short password, notes, search, context menu, masked detail, discard, tray restore, settings, password change, lock, reopen, and exit");
+                if (Application.OpenForms.Cast<Form>().Any(form => form.Visible))
+                    throw new Exception("Tray Exit left a window visible");
+                Console.WriteLine("PASS app entry, compact toolbar, eight rows per page, fixed height, short password, notes, search, context menu, masked detail, discard, tray restore from hidden or minimized, repeated launch restore, settings, password change, lock, reopen, and exit while unlock is visible");
             }
-            finally { timer.Stop(); Directory.Delete(folder, true); }
+            finally
+            {
+                timer.Stop();
+                if (repeatedLaunch != null)
+                {
+                    if (!repeatedLaunch.HasExited)
+                    {
+                        repeatedLaunch.Kill();
+                        repeatedLaunch.WaitForExit(5000);
+                    }
+                    repeatedLaunch.Dispose();
+                }
+                Directory.Delete(folder, true);
+            }
         }
         return 0;
     }

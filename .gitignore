@@ -1,0 +1,16 @@
+# Test and temporary verification outputs
+/tests/
+/.eight-page-build/
+/.resize-check-*/
+/.unlock-fix/
+/.fixed-height-build-*/
+
+# Local vault data
+*.qnv
+*.qnv-wal
+*.qnv-shm
+*.qnv-journal
+
+# Release archives
+/release/
+*.zip

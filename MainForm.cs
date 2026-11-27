@@ -20,8 +20,6 @@ internal sealed class MainForm : Form
     private readonly Timer clipboardExpiry = new Timer { Interval = 30000 };
     private Form dialog;
     private int offset;
-    private int heightBeforeResize;
-    private bool fitToRows = true;
     private bool closingSession;
     private uint copiedSequence;
     private Label copyStatus;
@@ -39,7 +37,7 @@ internal sealed class MainForm : Form
     internal MainForm(Store store)
     {
         this.store = store;
-        VaultLayout.Configure(this, "资料库", new Size(290, 205));
+        VaultLayout.Configure(this, "资料库", new Size(290, 284));
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(260, 140);
 
@@ -157,8 +155,6 @@ internal sealed class MainForm : Form
         clipboardExpiry.Tick += delegate { ClearOwnedClipboard(); };
         previous.Click += delegate { RefreshList(Math.Max(0, offset - PageSize)); };
         next.Click += delegate { RefreshList(offset + PageSize); };
-        ResizeBegin += delegate { heightBeforeResize = ClientSize.Height; };
-        ResizeEnd += delegate { if (ClientSize.Height != heightBeforeResize) fitToRows = false; };
         Shown += delegate {
             RefreshList(0);
             if (list.Items.Count > 0) list.Items[0].Selected = true;
@@ -197,7 +193,6 @@ internal sealed class MainForm : Form
                 }
             }
             finally { list.EndUpdate(); }
-            FitRecords();
             if (selected != null) selected.EnsureVisible();
             previous.Enabled = offset > 0;
             next.Enabled = summaries.Count > PageSize;
@@ -205,20 +200,6 @@ internal sealed class MainForm : Form
             status.Text = "";
         }
         catch (Exception ex) { Report("读取列表失败", ex); }
-    }
-
-    private void FitRecords()
-    {
-        if (!fitToRows || WindowState != FormWindowState.Normal) return;
-        int contentHeight = 2 * list.Font.Height + 6;
-        if (list.Items.Count > 0)
-        {
-            list.TopItem = list.Items[0];
-            Rectangle first = list.GetItemRect(0);
-            contentHeight = first.Top + first.Height * list.Items.Count;
-        }
-        int height = ClientSize.Height - list.ClientSize.Height + contentHeight;
-        if (height != ClientSize.Height) ClientSize = new Size(ClientSize.Width, height);
     }
 
     private void OpenSelected()
@@ -327,10 +308,10 @@ internal sealed class MainForm : Form
 
     internal void RestoreWindow()
     {
-        if (!Visible) Show();
-        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
-        if (dialog != null) dialog.Activate();
-        else Activate();
+        WindowVisibility.EnsureShown(this);
+        Form target = dialog ?? this;
+        if (dialog != null) WindowVisibility.EnsureShown(dialog);
+        target.Activate();
     }
 
     internal void CloseSession()
