@@ -49,26 +49,35 @@ internal sealed class MainForm : Form
         libraryPane.Padding = new Padding(8, 4, 8, 4);
         Controls.Add(libraryPane);
 
-        var toolbar = VaultLayout.Actions(3);
+        var toolbar = VaultLayout.Actions(4);
         query.Margin = new Padding(0, 2, 6, 2);
         query.HandleCreated += delegate {
             const int setCueBanner = 0x1501;
-            SendMessage(query.Handle, setCueBanner, new IntPtr(1), query.AccessibleName);
+            SendMessage(query.Handle, setCueBanner, new IntPtr(1), "标题或账号");
         };
         toolbar.Controls.Add(query, 0, 0);
+        var pin = UiStyle.IconButton(UiStyle.ToolbarIcon.Pin, "置顶窗口");
         var add = UiStyle.IconButton(UiStyle.ToolbarIcon.New, "新建");
         var lockButton = UiStyle.IconButton(UiStyle.ToolbarIcon.Lock, "锁定");
         var settingsButton = UiStyle.IconButton(UiStyle.ToolbarIcon.Settings, "设置");
+        toolbarTips.SetToolTip(pin, pin.AccessibleName);
         toolbarTips.SetToolTip(add, "新建");
         toolbarTips.SetToolTip(lockButton, "锁定");
         toolbarTips.SetToolTip(settingsButton, "设置");
         toolbarTips.SetToolTip(previous, "上一页");
         toolbarTips.SetToolTip(next, "下一页");
-        toolbar.Controls.Add(add, 1, 0);
-        toolbar.Controls.Add(lockButton, 2, 0);
-        toolbar.Controls.Add(settingsButton, 3, 0);
+        toolbar.Controls.Add(pin, 1, 0);
+        toolbar.Controls.Add(add, 2, 0);
+        toolbar.Controls.Add(lockButton, 3, 0);
+        toolbar.Controls.Add(settingsButton, 4, 0);
         VaultLayout.Row(libraryPane, toolbar, 34);
 
+        pin.Click += delegate {
+            TopMost = !TopMost;
+            UiStyle.SetIconActive(pin, TopMost);
+            pin.AccessibleName = TopMost ? "取消置顶" : "置顶窗口";
+            toolbarTips.SetToolTip(pin, pin.AccessibleName);
+        };
         settingsButton.Click += delegate { OpenSettings(); };
 
         list.Dock = DockStyle.Fill;

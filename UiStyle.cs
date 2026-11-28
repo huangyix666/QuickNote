@@ -5,7 +5,7 @@ using System.Windows.Forms;
 
 internal static class UiStyle
 {
-    internal enum ToolbarIcon { New, Lock, Settings, Previous, Next }
+    internal enum ToolbarIcon { New, Lock, Settings, Previous, Next, Pin }
 
     internal static readonly Icon AppIcon = LoadIcon();
     private static readonly PointF[] GearOutline = CreateGearOutline();
@@ -41,6 +41,11 @@ internal static class UiStyle
         button.Text = enabled ? "已开启" : "未开启";
         var color = enabled ? Color.FromArgb(36, 107, 73) : Color.FromArgb(159, 52, 53);
         ((RoundedButton)button).SetPalette(color, Color.White);
+    }
+
+    internal static void SetIconActive(Button button, bool active)
+    {
+        ((RoundedButton)button).SetPrimaryPalette(active);
     }
 
     internal static void FadeIn(Form form)
@@ -105,12 +110,17 @@ internal static class UiStyle
             FlatStyle = FlatStyle.Flat;
             FlatAppearance.BorderSize = 0;
             UseVisualStyleBackColor = false;
-            SetPalette(primary ? Color.FromArgb(38, 87, 71) : Color.FromArgb(236, 241, 235),
-                       primary ? Color.White : Color.FromArgb(29, 57, 48));
+            SetPrimaryPalette(primary);
             timer.Tick += delegate {
                 ApplyColor(Blend(from, to, ++step / (float)FadeSteps));
                 if (step == FadeSteps) timer.Stop();
             };
+        }
+
+        internal void SetPrimaryPalette(bool primary)
+        {
+            SetPalette(primary ? Color.FromArgb(38, 87, 71) : Color.FromArgb(236, 241, 235),
+                       primary ? Color.White : Color.FromArgb(29, 57, 48));
         }
 
         internal void SetPalette(Color background, Color foreground)
@@ -183,6 +193,16 @@ internal static class UiStyle
                         case ToolbarIcon.Settings:
                             graphics.DrawPolygon(pen, GearOutline);
                             graphics.DrawEllipse(pen, -2.1f, -2.1f, 4.2f, 4.2f);
+                            break;
+                        case ToolbarIcon.Pin:
+                            graphics.RotateTransform(35);
+                            graphics.DrawPolygon(pen, new[] {
+                                new PointF(-4, -6), new PointF(4, -6),
+                                new PointF(2.5f, -4), new PointF(2.5f, -1),
+                                new PointF(5, 2), new PointF(-5, 2),
+                                new PointF(-2.5f, -1), new PointF(-2.5f, -4)
+                            });
+                            graphics.DrawLine(pen, 0, 2, 0, 7);
                             break;
                         case ToolbarIcon.Previous:
                         case ToolbarIcon.Next:
