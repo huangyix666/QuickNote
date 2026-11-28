@@ -11,6 +11,8 @@
 *.qnv-shm
 *.qnv-journal
 *.qnv.moving
+/.workbuddy/
+/Cache/
 
 # Release archives
 /release/
